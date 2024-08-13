@@ -5,6 +5,7 @@ package main
 import (
 	"crypto/tls"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io/ioutil"
@@ -17,15 +18,25 @@ import (
 	"github.com/pelletier/go-toml"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"github.com/prometheus/common/expfmt"
 )
 
 var (
+	proxyAddr  = flag.String("proxy", "", "Proxy address, e.g. 127.0.0.1:8000. If set, run as a proxy to rewrite Go expvars into Prometheus metrics.")
 	configPath = flag.String("config", "config.toml",
 		"configuration file")
 )
 
 func main() {
 	flag.Parse()
+
+	if len(*proxyAddr) > 0 {
+		log.Printf("listen to %s in Proxy mode", *proxyAddr)
+		if err := http.ListenAndServe(*proxyAddr, new(Proxy)); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			log.Fatal("ListenAndServe:", err)
+		}
+		return
+	}
 
 	config, err := toml.LoadFile(*configPath)
 	if err != nil {
@@ -74,6 +85,44 @@ func main() {
 	addr := config.Get("listen_addr").(string)
 	log.Printf("Listening on %q", addr)
 	log.Fatal(http.ListenAndServe(addr, nil))
+}
+
+type Proxy struct{}
+
+func (p *Proxy) ServeHTTP(wr http.ResponseWriter, req *http.Request) {
+	log.Println(req.RemoteAddr, " ", req.Method, " ", req.URL)
+	c := &Collector{
+		url:       req.URL.String(),
+		names:     map[string]string{},
+		helps:     map[string]string{},
+		labelName: map[string]string{},
+	}
+	reg := prometheus.NewRegistry()
+	reg.Register(c)
+
+	mfs, merr := reg.Gather()
+	if merr != nil {
+		log.Println("failed to gather metrics: ", merr)
+		p.sendError(wr, merr)
+		return
+	}
+
+	enc := expfmt.NewEncoder(wr, expfmt.NewFormat(expfmt.TypeTextPlain))
+	for _, mf := range mfs {
+		eerr := enc.Encode(mf)
+		if eerr != nil {
+			p.sendError(wr, eerr)
+			return
+		}
+	}
+}
+
+func (p *Proxy) sendError(wr http.ResponseWriter, err error) {
+	wr.WriteHeader(http.StatusInternalServerError)
+	_, herr := wr.Write([]byte(err.Error()))
+	if herr != nil {
+		log.Println("failed to write response: ", herr)
+	}
 }
 
 type Collector struct {
@@ -141,49 +190,48 @@ func (c *Collector) Collect(ch chan<- prometheus.Metric) {
 	}
 
 	for k, v := range vs {
-		name := sanitizeMetricName(k)
-		if n, ok := c.names[k]; ok {
-			name = n
-		}
+		c.collectMetrics(ch, k, v)
+	}
+}
 
-		help := fmt.Sprintf("expvar %q", k)
-		if h, ok := c.helps[k]; ok {
-			help = h
-		}
+func (c *Collector) collectMetrics(ch chan<- prometheus.Metric, k string, v interface{}) {
+	name := sanitizeMetricName(k)
+	if n, ok := c.names[k]; ok {
+		name = n
+	}
 
-		lnames := []string{}
-		if ln, ok := c.labelName[k]; ok {
-			lnames = append(lnames, ln)
-		}
+	help := fmt.Sprintf("expvar %q", k)
+	if h, ok := c.helps[k]; ok {
+		help = h
+	}
 
-		desc := prometheus.NewDesc(name, help, lnames, nil)
+	lnames := []string{}
+	if ln, ok := c.labelName[k]; ok {
+		lnames = append(lnames, ln)
+	}
 
-		switch v := v.(type) {
-		case float64:
-			ch <- prometheus.MustNewConstMetric(desc, prometheus.UntypedValue, v)
-		case bool:
-			ch <- prometheus.MustNewConstMetric(desc, prometheus.UntypedValue,
-				valToFloat(v))
-		case map[string]interface{}:
-			// We only support explicitly written label names.
-			if len(lnames) != 1 {
-				continue
-			}
-			for lk, lv := range v {
-				ch <- prometheus.MustNewConstMetric(desc, prometheus.UntypedValue,
-					valToFloat(lv), lk)
-			}
-		case string:
-			// Not supported by Prometheus.
-			continue
-		case []interface{}:
-			// Not supported by Prometheus.
-			continue
-		default:
-			// TODO: support nested labels / richer structures?
-			//fmt.Printf("Not supported: %q %#v\n", name, v)
-			continue
+	desc := prometheus.NewDesc(name, help, lnames, nil)
+
+	switch v := v.(type) {
+	case float64:
+		ch <- prometheus.MustNewConstMetric(desc, prometheus.UntypedValue, v)
+	case bool:
+		ch <- prometheus.MustNewConstMetric(desc, prometheus.UntypedValue,
+			valToFloat(v))
+	case map[string]interface{}:
+		for lk, lv := range v {
+			c.collectMetrics(ch, k+"_"+lk, lv)
 		}
+	case string:
+		// Not supported by Prometheus.
+		return
+	case []interface{}:
+		// Not supported by Prometheus.
+		return
+	default:
+		// TODO: support nested labels / richer structures?
+		fmt.Printf("Not supported unknown type: %q %#v\n", name, v)
+		return
 	}
 }
 
