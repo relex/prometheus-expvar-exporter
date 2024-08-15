@@ -1,5 +1,3 @@
-// prometheus-expvar-exporter collects expvar metrics from different sources,
-// and exports them for Prometheus.
 package main
 
 import (

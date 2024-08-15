@@ -1,2 +1,2 @@
-prometheus-expvar-exporter
-.*
+.DS_Store
+prometheus-expvar-proxy

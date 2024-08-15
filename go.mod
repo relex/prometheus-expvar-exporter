@@ -1,4 +1,4 @@
-module blitiri.com.ar/go/prometheus-expvar-exporter
+module github.com/relex/prometheus-expvar-proxy
 
 go 1.18
 
