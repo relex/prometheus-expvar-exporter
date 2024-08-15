@@ -3,176 +3,85 @@
 package main
 
 import (
-	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"regexp"
+	"sort"
 	"strings"
 	"unicode"
 
-	"github.com/pelletier/go-toml"
-	"github.com/prometheus/client_golang/prometheus"
-	"github.com/prometheus/client_golang/prometheus/promhttp"
-	"github.com/prometheus/common/expfmt"
+	"golang.org/x/exp/maps"
 )
 
 var (
-	proxyAddr  = flag.String("proxy", "", "Proxy address, e.g. 127.0.0.1:8000. If set, run as a proxy to rewrite Go expvars into Prometheus metrics.")
-	configPath = flag.String("config", "config.toml",
-		"configuration file")
+	proxyAddr = flag.String("addr", "127.0.0.1:8000", "Proxy address, e.g. 127.0.0.1:8000.")
 )
 
 func main() {
 	flag.Parse()
 
-	if len(*proxyAddr) > 0 {
-		log.Printf("listen to %s in Proxy mode", *proxyAddr)
-		if err := http.ListenAndServe(*proxyAddr, new(Proxy)); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			log.Fatal("ListenAndServe:", err)
-		}
-		return
+	log.Printf("listen to %s in Proxy mode", *proxyAddr)
+	if err := http.ListenAndServe(*proxyAddr, new(Proxy)); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		log.Fatal("ListenAndServe:", err)
 	}
-
-	config, err := toml.LoadFile(*configPath)
-	if err != nil {
-		log.Fatalf("error loading config file %q: %v", *configPath, err)
-	}
-
-	for _, t := range config.Keys() {
-		if !config.Has(t + ".url") {
-			continue
-		}
-
-		c := &Collector{
-			url:       config.Get(t + ".url").(string),
-			names:     map[string]string{},
-			helps:     map[string]string{},
-			labelName: map[string]string{},
-		}
-
-		if config.Has(t + ".insecure") {
-			c.insecure = config.Get(t + ".insecure").(bool)
-		}
-
-		mnames := config.GetDefault(t+".m", &toml.Tree{}).(*toml.Tree).Keys()
-		for _, name := range mnames {
-			info := config.Get(t + ".m." + name).(*toml.Tree)
-			expvar := info.Get("expvar").(string)
-			c.names[expvar] = name
-			if info.Has("help") {
-				c.helps[expvar] = info.Get("help").(string)
-			}
-			if info.Has("label_name") {
-				c.labelName[expvar] = info.Get("label_name").(string)
-			}
-		}
-
-		log.Printf("Collecting %q\n", c.url)
-		prometheus.MustRegister(c)
-	}
-
-	http.HandleFunc("/", indexHandler)
-	http.Handle("/metrics", promhttp.Handler())
-
-	if !config.Has("listen_addr") {
-		log.Fatal("Configuration has no listen_addr")
-	}
-	addr := config.Get("listen_addr").(string)
-	log.Printf("Listening on %q", addr)
-	log.Fatal(http.ListenAndServe(addr, nil))
 }
 
 type Proxy struct{}
 
 func (p *Proxy) ServeHTTP(wr http.ResponseWriter, req *http.Request) {
 	log.Println(req.RemoteAddr, " ", req.Method, " ", req.URL)
-	c := &Collector{
-		url:       req.URL.String(),
-		names:     map[string]string{},
-		helps:     map[string]string{},
-		labelName: map[string]string{},
-	}
-	reg := prometheus.NewRegistry()
-	reg.Register(c)
 
-	mfs, merr := reg.Gather()
-	if merr != nil {
-		log.Println("failed to gather metrics: ", merr)
-		p.sendError(wr, merr)
+	metricMap, cerr := CollectWithError(req.URL)
+	if cerr != nil {
+		log.Println("failed to gather metrics: ", cerr)
+		if errors.Is(cerr, ErrTargetInaccessible) {
+			p.sendError(wr, http.StatusGatewayTimeout, cerr)
+		} else {
+			p.sendError(wr, http.StatusBadGateway, cerr)
+		}
 		return
 	}
 
-	enc := expfmt.NewEncoder(wr, expfmt.NewFormat(expfmt.TypeTextPlain))
-	for _, mf := range mfs {
-		eerr := enc.Encode(mf)
-		if eerr != nil {
-			p.sendError(wr, eerr)
-			return
-		}
+	metricNames := maps.Keys(metricMap)
+	sort.Strings(metricNames)
+
+	sb := &strings.Builder{}
+	for _, name := range metricNames {
+		sb.WriteString(fmt.Sprintf("%s %f\n", name, metricMap[name]))
+	}
+
+	wr.WriteHeader(http.StatusOK)
+	_, werr := wr.Write([]byte(sb.String()))
+	if werr != nil {
+		log.Println("failed to send metrics: ", werr)
 	}
 }
 
-func (p *Proxy) sendError(wr http.ResponseWriter, err error) {
-	wr.WriteHeader(http.StatusInternalServerError)
+func (p *Proxy) sendError(wr http.ResponseWriter, statusCode int, err error) {
+	wr.WriteHeader(statusCode)
 	_, herr := wr.Write([]byte(err.Error()))
 	if herr != nil {
-		log.Println("failed to write response: ", herr)
+		log.Println("failed to send error: ", herr)
 	}
 }
 
-type Collector struct {
-	// URL to collect from.
-	url string
+var ErrTargetInaccessible = errors.New("inaccessible target")
 
-	// Disable TLS checking for this URL.
-	insecure bool
-
-	// expvar -> prometheus name
-	names map[string]string
-
-	// expvar -> prometheus help
-	helps map[string]string
-
-	// expvar -> prometheus label name
-	labelName map[string]string
-}
-
-func (c *Collector) Describe(ch chan<- *prometheus.Desc) {
-	// Not returning anything is explicitly allowed, and seems to fit our use
-	// case.
-	// From the documentation:
-	//   Sending no descriptor at all marks the Collector as “unchecked”, i.e.
-	//   no checks will be performed at registration time, and the Collector
-	//   may yield any Metric it sees fit in its Collect method/
-	return
-}
-
-func (c *Collector) GetURL() (*http.Response, error) {
-	client := &http.Client{}
-	if c.insecure {
-		client.Transport = &http.Transport{
-			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
-		}
-	}
-	return client.Get(c.url)
-}
-
-func (c *Collector) Collect(ch chan<- prometheus.Metric) {
-	resp, err := c.GetURL()
+func CollectWithError(target *url.URL) (map[string]float64, error) {
+	resp, err := http.Get(target.String())
 	if err != nil {
-		log.Printf("Error scraping %q: %v", c.url, err)
-		return
+		return nil, fmt.Errorf("%w; error scraping %q: %w", ErrTargetInaccessible, target, err)
 	}
 
-	body, err := ioutil.ReadAll(resp.Body)
+	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		log.Printf("Error reading body of %q: %v", c.url, err)
-		return
+		return nil, fmt.Errorf("%w; error reading body of %q: %w", ErrTargetInaccessible, target, err)
 	}
 
 	// Replace "\xNN" with "?" because the default parser doesn't handle them
@@ -185,42 +94,27 @@ func (c *Collector) Collect(ch chan<- prometheus.Metric) {
 	var vs map[string]interface{}
 	err = json.Unmarshal(body, &vs)
 	if err != nil {
-		log.Printf("Error unmarshalling json from %q: %v", c.url, err)
-		return
+		return nil, fmt.Errorf("error unmarshalling JSON from %q: %v", target, err)
 	}
 
+	mm := make(map[string]float64, 1000)
 	for k, v := range vs {
-		c.collectMetrics(ch, k, v)
+		collectMetrics(mm, k, v)
 	}
+	return mm, nil
 }
 
-func (c *Collector) collectMetrics(ch chan<- prometheus.Metric, k string, v interface{}) {
+func collectMetrics(mm map[string]float64, k string, v interface{}) {
 	name := sanitizeMetricName(k)
-	if n, ok := c.names[k]; ok {
-		name = n
-	}
-
-	help := fmt.Sprintf("expvar %q", k)
-	if h, ok := c.helps[k]; ok {
-		help = h
-	}
-
-	lnames := []string{}
-	if ln, ok := c.labelName[k]; ok {
-		lnames = append(lnames, ln)
-	}
-
-	desc := prometheus.NewDesc(name, help, lnames, nil)
 
 	switch v := v.(type) {
 	case float64:
-		ch <- prometheus.MustNewConstMetric(desc, prometheus.UntypedValue, v)
+		mm[name] = v
 	case bool:
-		ch <- prometheus.MustNewConstMetric(desc, prometheus.UntypedValue,
-			valToFloat(v))
+		mm[name] = valToFloat(v)
 	case map[string]interface{}:
 		for lk, lv := range v {
-			c.collectMetrics(ch, k+"_"+lk, lv)
+			collectMetrics(mm, k+"_"+lk, lv)
 		}
 	case string:
 		// Not supported by Prometheus.
@@ -229,7 +123,6 @@ func (c *Collector) collectMetrics(ch chan<- prometheus.Metric, k string, v inte
 		// Not supported by Prometheus.
 		return
 	default:
-		// TODO: support nested labels / richer structures?
 		fmt.Printf("Not supported unknown type: %q %#v\n", name, v)
 		return
 	}
@@ -286,28 +179,4 @@ func sanitizeMetricName(n string) string {
 		}
 		return '_'
 	}, n)
-}
-
-const indexHTML = `<!DOCTYPE html>
-<html lang="en">
-  <head>
-    <meta charset="utf-8">
-    <title>expvar exporter</title>
-  </head>
-  <body>
-    <h1>Prometheus expvar exporter</h1>
-
-    This is a <a href="https://prometheus.io">Prometheus</a>
-    <a href="https://prometheus.io/docs/instrumenting/exporters/">exporter</a>,
-    takes <a href="https://golang.org/pkg/expvar/">expvars</a> and converts
-    them to Prometheus metrics.<p>
-
-    Go to <tt><a href="/metrics">/metrics</a></tt> to see the exported metrics.
-
-  </body>
-</html
-`
-
-func indexHandler(w http.ResponseWriter, r *http.Request) {
-	w.Write([]byte(indexHTML))
 }
