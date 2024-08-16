@@ -12,30 +12,39 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"time"
 	"unicode"
 
 	"golang.org/x/exp/maps"
 )
 
 var (
-	proxyAddr = flag.String("addr", "127.0.0.1:8000", "Proxy address, e.g. 127.0.0.1:8000.")
+	configAddr    = flag.String("addr", "127.0.0.1:8000", "Address to listen proxy requests, e.g. 0.0.0.0:8000.")
+	configTimeout = flag.Duration("timeout", 30*time.Second, "HTTP client timeout.")
 )
 
 func main() {
 	flag.Parse()
 
-	log.Printf("listen to %s in Proxy mode", *proxyAddr)
-	if err := http.ListenAndServe(*proxyAddr, new(Proxy)); err != nil && !errors.Is(err, http.ErrServerClosed) {
+	log.Printf("listen to %s in Proxy mode, timeout: %v", *configAddr, *configTimeout)
+	proxy := &Proxy{
+		Client: http.Client{
+			Timeout: *configTimeout,
+		},
+	}
+	if err := http.ListenAndServe(*configAddr, proxy); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		log.Fatal("ListenAndServe:", err)
 	}
 }
 
-type Proxy struct{}
+type Proxy struct {
+	Client http.Client
+}
 
 func (p *Proxy) ServeHTTP(wr http.ResponseWriter, req *http.Request) {
 	log.Println(req.RemoteAddr, " ", req.Method, " ", req.URL)
 
-	metricMap, cerr := CollectWithError(req.URL)
+	metricMap, cerr := p.collect(req.URL)
 	if cerr != nil {
 		log.Println("failed to gather metrics: ", cerr)
 		if errors.Is(cerr, ErrTargetInaccessible) {
@@ -71,8 +80,8 @@ func (p *Proxy) sendError(wr http.ResponseWriter, statusCode int, err error) {
 
 var ErrTargetInaccessible = errors.New("inaccessible target")
 
-func CollectWithError(target *url.URL) (map[string]float64, error) {
-	resp, err := http.Get(target.String())
+func (p *Proxy) collect(target *url.URL) (map[string]float64, error) {
+	resp, err := p.Client.Get(target.String())
 	if err != nil {
 		return nil, fmt.Errorf("%w; error scraping %q: %w", ErrTargetInaccessible, target, err)
 	}
